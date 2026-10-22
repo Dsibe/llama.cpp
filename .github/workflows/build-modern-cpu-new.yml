@@ -1,0 +1,103 @@
+name: Build Modern Windows x64 CPU
+
+on:
+  workflow_dispatch: # Allows manual trigger via the GitHub UI
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/build-modern-cpu.yml'
+      - '**/CMakeLists.txt'
+      - '**/*.h'
+      - '**/*.hpp'
+      - '**/*.c'
+      - '**/*.cpp'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-cpu-modern:
+    name: Build Windows x64 (Modern CPU)
+    runs-on: windows-2025-vs2026 # Visual Studio 2026 + Clang 20.x
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Setup ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: llama-modern-cpu-win-${{ runner.os }}
+          evict-old-files: 1d
+
+      - name: Build Modern x64 CPU
+        shell: cmd
+        run: |
+          :: Initialize the Visual Studio x64 environment
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+          :: Configure CMake: x86-64-v3 host + Global ThinLTO + All Variants Dispatch
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -D CMAKE_C_FLAGS="-march=x86-64-v3" ^
+            -D CMAKE_CXX_FLAGS="-march=x86-64-v3" ^
+            -D CMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+            -D GGML_NATIVE=OFF ^
+            -D GGML_BACKEND_DL=ON ^
+            -D GGML_CPU_ALL_VARIANTS=ON ^
+            -D GGML_OPENMP=ON ^
+            -D GGML_OPENMP_FETCH=ON ^
+            -D GGML_BLAS=OFF ^
+            -D LLAMA_BUILD_BORINGSSL=ON ^
+            -D LLAMA_BUILD_SERVER=ON ^
+            -D LLAMA_BUILD_TOOLS=ON ^
+            -D GGML_RPC=ON ^
+            -D LLAMA_CONNECT=ON ^
+            -D LLAMA_BUILD_EXAMPLES=OFF ^
+            -D LLAMA_BUILD_TESTS=OFF
+
+          :: Compile release binaries
+          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
+
+      - name: Pack Artifacts
+        shell: cmd
+        run: |
+          :: 1. Copy License
+          copy LICENSE .\build\bin\Release\
+
+          :: 2. Prune dead-weight legacy fallback DLLs (poisoned by AVX2 and unneeded on modern CPUs)
+          del /Q .\build\bin\Release\ggml-cpu-x64.dll
+          del /Q .\build\bin\Release\ggml-cpu-sse42.dll
+          del /Q .\build\bin\Release\ggml-cpu-sandybridge.dll
+          del /Q .\build\bin\Release\ggml-cpu-ivybridge.dll
+          del /Q .\build\bin\Release\ggml-cpu-piledriver.dll
+
+          :: 3. Generate a one-click high-performance launcher for end users
+          (
+            echo @echo off
+            echo :: llama-server Optimized Windows Launcher for Modern CPUs
+            echo :: Enables active OpenMP thread polling and thread binding
+            echo set OMP_PROC_BIND=close
+            echo set OMP_PLACES=cores
+            echo set OMP_WAIT_POLICY=ACTIVE
+            echo set OMP_DYNAMIC=false
+            echo echo [INFO] OpenMP optimized latency environment loaded.
+            echo llama-server.exe --flash-attn on %%*
+          ) > .\build\bin\Release\run-server-optimized.bat
+
+          :: 4. Archive into Release ZIP
+          7z a -snl llama-bin-win-cpu-modern-x64.zip .\build\bin\Release\*
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-bin-win-cpu-modern-x64
+          path: llama-bin-win-cpu-modern-x64.zip
+          retention-days: 14
