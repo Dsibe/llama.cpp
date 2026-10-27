@@ -197,6 +197,9 @@ struct server_task {
         // if set, embeddings is [q | k], and the output is instead the scaled dot product of q[pointer] and k[marker]
         int32_t                  pointer = -1;
 
+        // if set, the outputs are the pooled embeddings of the sequence, one score per class
+        bool                     pooled = false;
+
         // first prompt position that is read, -1 if none
         int32_t pos_first() const {
             int32_t pos = pointer;
@@ -238,7 +241,7 @@ struct server_task {
             case SERVER_TASK_TYPE_RERANK:
                 return true;
             case SERVER_TASK_TYPE_DECISION:
-                return !decision.markers.empty() || !decision.order.empty();
+                return !decision.markers.empty() || !decision.order.empty() || decision.pooled;
             default:
                 return false;
         }
@@ -470,6 +473,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     bool is_progress = false;
     bool is_begin = false; // whether to send 200 status to HTTP client (begin of SSE stream)
                            // ref: https://github.com/ggml-org/llama.cpp/pull/23884
+    bool audio_commit_drained = false; // realtime: non-final commit has fully decoded
     completion_token_output prob_output;
     server_slot_stats stats;
     result_prompt_progress progress;
