@@ -72,25 +72,12 @@ jobs:
           :: 1. Copy License
           copy LICENSE .\build\bin\Release\
 
-          :: 2. Prune dead-weight legacy fallback DLLs (poisoned by AVX2 and unneeded on modern CPUs)
+          :: 2. Prune dead-weight legacy fallback DLLs
           del /Q .\build\bin\Release\ggml-cpu-x64.dll
           del /Q .\build\bin\Release\ggml-cpu-sse42.dll
           del /Q .\build\bin\Release\ggml-cpu-sandybridge.dll
           del /Q .\build\bin\Release\ggml-cpu-ivybridge.dll
           del /Q .\build\bin\Release\ggml-cpu-piledriver.dll
-
-          :: 3. Generate a one-click high-performance launcher for end users
-          (
-            echo @echo off
-            echo :: llama-server Optimized Windows Launcher for Modern CPUs
-            echo :: Enables active OpenMP thread polling and thread binding
-            echo set OMP_PROC_BIND=close
-            echo set OMP_PLACES=cores
-            echo set OMP_WAIT_POLICY=ACTIVE
-            echo set OMP_DYNAMIC=false
-            echo echo [INFO] OpenMP optimized latency environment loaded.
-            echo llama-server.exe --flash-attn on %%*
-          ) > .\build\bin\Release\run-server-optimized.bat
 
           :: 4. Archive into Release ZIP
           7z a -snl llama-bin-win-cpu-modern-x64.zip .\build\bin\Release\*
