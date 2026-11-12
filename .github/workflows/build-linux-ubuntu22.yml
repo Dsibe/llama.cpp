@@ -1,7 +1,7 @@
 name: Build Ubuntu 22.04 LTS Compatible Binaries
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # Manual trigger only
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -28,7 +28,7 @@ jobs:
             gcc_version: '13'
             defines: '-DGGML_VULKAN=ON'
 
-          # --- arm64 Targets (GCC 14 required for ARMv9.2 SME + Static libstdc++) ---
+          # --- arm64 Targets (GCC 14 for ARMv9.2 SME + Static libstdc++) ---
           - arch: 'arm64'
             backend: 'cpu'
             runner: 'ubuntu-22.04-arm'
@@ -58,33 +58,44 @@ jobs:
         if: ${{ matrix.backend == 'vulkan' }}
         run: |
           if [ "${{ matrix.arch }}" = "x64" ]; then
-            # LunarG Jammy repository for x64 (glslc is bundled inside vulkan-sdk)
-            wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+            # LunarG Jammy repository for x64
+            wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
             sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
             sudo apt-get update -y
-            sudo apt-get install -y mesa-vulkan-drivers vulkan-sdk
+            sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers vulkan-sdk
           else
-            # Native arm64 Vulkan headers and shaderc (which provides /usr/bin/glslc)
-            sudo apt-get install -y libvulkan-dev shaderc spirv-tools mesa-vulkan-drivers
+            # Native ARM64: install Vulkan libraries + fetch standalone glslc for Ubuntu 22.04
+            sudo apt-get install -y libvulkan-dev spirv-tools mesa-vulkan-drivers
+            
+            SDK_VER="1.4.321.1"
+            echo "Fetching ARM64 glslc binary..."
+            curl -fsSL "https://github.com/jakoch/vulkan-sdk-arm/releases/download/${SDK_VER}/vulkansdk-ubuntu-22.04-arm-${SDK_VER}.tar.xz" -o /tmp/vulkan-sdk.tar.xz
+            sudo tar -xJf /tmp/vulkan-sdk.tar.xz --wildcards '*/bin/glslc' -O | sudo tee /usr/local/bin/glslc > /dev/null
+            sudo chmod +x /usr/local/bin/glslc
+            rm -f /tmp/vulkan-sdk.tar.xz
+            
+            # Verify glslc binary executes cleanly
+            glslc --version
           fi
 
       - name: Setup ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: llama-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}-v2
+          key: llama-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}-v4
           evict-old-files: 1d
 
-      - name: Build Binaries
+      - name: Build Linux Binaries
         run: |
-          # Inject static libgcc and libstdc++ so binaries run on clean Ubuntu 22.04 without GLIBCXX errors
-          STATIC_FLAGS="-static-libgcc -static-libstdc++"
+          # Apply static libgcc and libstdc++ across executables, shared libraries, and dynamic CPU modules
+          STATIC_LIBS="-static-libgcc -static-libstdc++"
 
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DCMAKE_EXE_LINKER_FLAGS="${STATIC_FLAGS}" \
-            -DCMAKE_SHARED_LINKER_FLAGS="${STATIC_FLAGS}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${STATIC_LIBS}" \
+            -DCMAKE_SHARED_LINKER_FLAGS="${STATIC_LIBS}" \
+            -DCMAKE_MODULE_LINKER_FLAGS="${STATIC_LIBS}" \
             -DGGML_NATIVE=OFF \
             -DGGML_BACKEND_DL=ON \
             -DGGML_CPU_ALL_VARIANTS=ON \
@@ -100,18 +111,21 @@ jobs:
 
           cmake --build build --config Release -j $(nproc)
 
-      - name: Verify GLIBC and GLIBCXX Compatibility
+      - name: Verify Clean GLIBC & libstdc++ Decoupling
         run: |
-          echo "=== Auditing linked GLIBC & GLIBCXX symbols ==="
-          # Verify GLIBC <= 2.35 and ensure GLIBCXX_3.4.32 is NOT required dynamically
-          objdump -p build/bin/llama-cli | grep -E 'GLIBC_|GLIBCXX_' || true
+          echo "=== 1. Checking NEEDED libraries (libstdc++.so must NOT be listed) ==="
+          [ -f build/bin/llama-server ] && readelf -d build/bin/llama-server | grep NEEDED || true
+          [ -f build/bin/libllama-server-impl.so ] && readelf -d build/bin/libllama-server-impl.so | grep NEEDED || true
 
-      - name: Pack Artifacts
+          echo "=== 2. Checking symbol versions (GLIBCXX must NOT appear) ==="
+          [ -f build/bin/libllama-server-impl.so ] && objdump -p build/bin/libllama-server-impl.so | grep GLIBCXX || true
+
+      - name: Pack Linux Artifacts
         run: |
           cp LICENSE build/bin/
           tar -czvf llama-bin-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}.tar.gz -C build/bin .
 
-      - name: Upload Artifact
+      - name: Upload Linux Artifact
         uses: actions/upload-artifact@v4
         with:
           name: llama-bin-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}
