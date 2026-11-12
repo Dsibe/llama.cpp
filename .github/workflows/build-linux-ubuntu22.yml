@@ -64,8 +64,8 @@ jobs:
             sudo apt-get update -y
             sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers vulkan-sdk
           else
-            # Native ARM64: install Vulkan libraries + fetch standalone glslc for Ubuntu 22.04
-            sudo apt-get install -y libvulkan-dev spirv-tools mesa-vulkan-drivers
+            # Native ARM64: install Vulkan libraries, SPIRV headers, and fetch standalone glslc
+            sudo apt-get install -y libvulkan-dev spirv-headers spirv-tools mesa-vulkan-drivers
             
             SDK_VER="1.4.321.1"
             echo "Fetching ARM64 glslc binary..."
@@ -81,7 +81,7 @@ jobs:
       - name: Setup ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: llama-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}-v4
+          key: llama-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}-v5
           evict-old-files: 1d
 
       - name: Build Linux Binaries
