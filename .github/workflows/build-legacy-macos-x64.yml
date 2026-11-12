@@ -1,0 +1,65 @@
+name: Build Legacy macOS Intel x64 CPU
+
+on:
+  workflow_dispatch:
+
+jobs:
+  macos-legacy-x64:
+    name: Build macOS Legacy Intel x64 (2012-2020)
+    # macos-15-intel is GitHub's official x86_64 Intel runner
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: Setup ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: llama-legacy-macos-x64-${{ runner.os }}
+          evict-old-files: 1d
+
+      - name: Build Legacy x64 CPU
+        run: |
+          cmake -S . -B build -G "Ninja Multi-Config" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="11.0" \
+            -DCMAKE_INSTALL_RPATH='@loader_path' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BLAS=OFF \
+            -DGGML_METAL=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DLLAMA_BUILD_BORINGSSL=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DGGML_RPC=ON \
+            -DLLAMA_CONNECT=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TESTS=OFF
+
+          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
+
+      - name: Verify Dynamic Variant Dylibs
+        run: |
+          echo "=== Built Binaries and dylibs ==="
+          ls -la build/bin/Release/
+
+      - name: Pack Artifacts
+        run: |
+          cp LICENSE build/bin/Release/
+          tar -czvf llama-bin-macos-legacy-x64.tar.gz -C build/bin/Release .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-bin-macos-legacy-x64
+          path: llama-bin-macos-legacy-x64.tar.gz
+          retention-days: 14
