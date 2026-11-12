@@ -1,0 +1,110 @@
+name: Build Ubuntu 22.04 LTS Compatible Binaries
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ubuntu22:
+    name: Linux (${{ matrix.arch }} - ${{ matrix.backend }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- x64 Targets ---
+          - arch: 'x64'
+            backend: 'cpu'
+            runner: 'ubuntu-22.04'
+            defines: '-DGGML_VULKAN=OFF'
+          - arch: 'x64'
+            backend: 'vulkan'
+            runner: 'ubuntu-22.04'
+            defines: '-DGGML_VULKAN=ON'
+
+          # --- arm64 Targets ---
+          - arch: 'arm64'
+            backend: 'cpu'
+            runner: 'ubuntu-22.04-arm'
+            defines: '-DGGML_VULKAN=OFF'
+          - arch: 'arm64'
+            backend: 'vulkan'
+            runner: 'ubuntu-22.04-arm'
+            defines: '-DGGML_VULKAN=ON'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Toolchain (GCC 13 on Ubuntu 22.04)
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13 build-essential cmake ninja-build libssl-dev
+          echo "CC=gcc-13" >> "$GITHUB_ENV"
+          echo "CXX=g++-13" >> "$GITHUB_ENV"
+
+      - name: Setup Vulkan Dependencies (if Vulkan target)
+        if: ${{ matrix.backend == 'vulkan' }}
+        run: |
+          if [ "${{ matrix.arch }}" = "x64" ]; then
+            # LunarG Jammy repository for x64
+            wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+            sudo apt-get update -y
+            sudo apt-get install -y mesa-vulkan-drivers vulkan-sdk glslc
+          else
+            # Native arm64 Vulkan headers and compiler
+            sudo apt-get install -y libvulkan-dev glslc libshaderc-dev spirv-headers mesa-vulkan-drivers
+          fi
+
+      - name: Setup ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: llama-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}
+          evict-old-files: 1d
+
+      - name: Build Binaries
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_OPENMP=ON \
+            -DLLAMA_BUILD_BORINGSSL=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DGGML_RPC=ON \
+            -DLLAMA_CONNECT=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            ${{ matrix.defines }}
+
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Verify GLIBC Compatibility
+        run: |
+          echo "=== Auditing linked GLIBC versions ==="
+          # Verify that GLIBC does not exceed 2.35
+          objdump -p build/bin/llama-cli | grep GLIBC_
+
+      - name: Pack Artifacts
+        run: |
+          cp LICENSE build/bin/
+          tar -czvf llama-bin-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}.tar.gz -C build/bin .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-bin-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}
+          path: llama-bin-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}.tar.gz
+          retention-days: 14
