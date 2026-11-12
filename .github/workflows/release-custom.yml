@@ -59,11 +59,11 @@ jobs:
         shell: cmd
         run: |
           copy LICENSE .\build\bin\Release\
-          del /Q .\build\bin\Release\ggml-cpu-x64.dll
-          del /Q .\build\bin\Release\ggml-cpu-sse42.dll
-          del /Q .\build\bin\Release\ggml-cpu-sandybridge.dll
-          del /Q .\build\bin\Release\ggml-cpu-ivybridge.dll
-          del /Q .\build\bin\Release\ggml-cpu-piledriver.dll
+          del /Q .\build\bin\Release\ggml-cpu-x64.dll 2>nul || true
+          del /Q .\build\bin\Release\ggml-cpu-sse42.dll 2>nul || true
+          del /Q .\build\bin\Release\ggml-cpu-sandybridge.dll 2>nul || true
+          del /Q .\build\bin\Release\ggml-cpu-ivybridge.dll 2>nul || true
+          del /Q .\build\bin\Release\ggml-cpu-piledriver.dll 2>nul || true
 
           (
             echo @echo off
@@ -146,13 +146,14 @@ jobs:
   # 3. LINUX UBUNTU 22.04 LTS (x64 & arm64 | CPU & Vulkan)
   # =========================================================================
   linux-ubuntu22:
-    name: Linux 22.04 (${{ matrix.arch }} - ${{ matrix.backend }})
+    name: Linux (${{ matrix.arch }} - ${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
 
     strategy:
       fail-fast: false
       matrix:
         include:
+          # --- x64 Targets (GCC 13 + Static libstdc++) ---
           - arch: 'x64'
             backend: 'cpu'
             runner: 'ubuntu-22.04'
@@ -163,10 +164,12 @@ jobs:
             runner: 'ubuntu-22.04'
             gcc_version: '13'
             defines: '-DGGML_VULKAN=ON'
+
+          # --- arm64 Targets (GCC 14 for ARMv9.2 SME + Static libstdc++) ---
           - arch: 'arm64'
             backend: 'cpu'
             runner: 'ubuntu-22.04-arm'
-            gcc_version: '14' # GCC 14 required for ARMv9.2 SME modifier
+            gcc_version: '14'
             defines: '-DGGML_VULKAN=OFF'
           - arch: 'arm64'
             backend: 'vulkan'
@@ -192,24 +195,50 @@ jobs:
         if: ${{ matrix.backend == 'vulkan' }}
         run: |
           if [ "${{ matrix.arch }}" = "x64" ]; then
-            # LunarG Jammy repository: vulkan-sdk includes glslc
-            wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+            # LunarG Jammy repository for x64
+            wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
             sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
             sudo apt-get update -y
-            sudo apt-get install -y mesa-vulkan-drivers vulkan-sdk
+            sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers vulkan-sdk
           else
-            # ARM64: shaderc provides /usr/bin/glslc on Ubuntu 22.04
-            sudo apt-get install -y libvulkan-dev shaderc spirv-tools mesa-vulkan-drivers
+            # 1. Install base loader and Mesa drivers
+            sudo apt-get install -y libvulkan-dev spirv-headers spirv-tools mesa-vulkan-drivers
+
+            # 2. Download ARM64 Vulkan 1.4 SDK (provides both glslc and modern Vulkan 1.4 headers)
+            SDK_VER="1.4.321.1"
+            echo "Fetching ARM64 Vulkan 1.4 SDK..."
+            curl -fsSL "https://github.com/jakoch/vulkan-sdk-arm/releases/download/${SDK_VER}/vulkansdk-ubuntu-22.04-arm-${SDK_VER}.tar.xz" -o /tmp/vulkan-sdk.tar.xz
+            sudo mkdir -p /opt/vulkan-sdk
+            sudo tar -xJf /tmp/vulkan-sdk.tar.xz -C /opt/vulkan-sdk
+            rm -f /tmp/vulkan-sdk.tar.xz
+
+            # Locate the extracted SDK directory
+            VDIR=$(find /opt/vulkan-sdk -type d -name "aarch64" | head -n 1)
+
+            # 3. Copy glslc compiler to /usr/local/bin
+            sudo cp "${VDIR}/bin/glslc" /usr/local/bin/
+            sudo chmod +x /usr/local/bin/glslc
+
+            # 4. Overwrite ancient Ubuntu 22.04 headers with modern Vulkan 1.4.321 headers
+            sudo cp -r ${VDIR}/include/* /usr/include/
+
+            # 5. Set environment variables
+            echo "VULKAN_SDK=${VDIR}" >> "$GITHUB_ENV"
+            echo "${VDIR}/bin" >> "$GITHUB_PATH"
+            echo "CMAKE_PREFIX_PATH=${VDIR}" >> "$GITHUB_ENV"
+
+            glslc --version
           fi
 
       - name: Setup ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: llama-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}-v3
+          key: llama-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}-v7
           evict-old-files: 1d
 
       - name: Build Linux Binaries
         run: |
+          # Apply static libgcc and libstdc++ across executables, shared libraries, and dynamic CPU modules
           STATIC_LIBS="-static-libgcc -static-libstdc++"
 
           cmake -S . -B build -G Ninja \
@@ -237,11 +266,11 @@ jobs:
       - name: Verify Clean GLIBC & libstdc++ Decoupling
         run: |
           echo "=== 1. Checking NEEDED libraries (libstdc++.so must NOT be listed) ==="
-          readelf -d build/bin/llama-server | grep NEEDED || true
-          readelf -d build/bin/libllama-server-impl.so | grep NEEDED || true
+          [ -f build/bin/llama-server ] && readelf -d build/bin/llama-server | grep NEEDED || true
+          [ -f build/bin/libllama-server-impl.so ] && readelf -d build/bin/libllama-server-impl.so | grep NEEDED || true
 
           echo "=== 2. Checking symbol versions (GLIBCXX must NOT appear) ==="
-          objdump -p build/bin/libllama-server-impl.so | grep GLIBCXX || true
+          [ -f build/bin/libllama-server-impl.so ] && objdump -p build/bin/libllama-server-impl.so | grep GLIBCXX || true
 
       - name: Pack Linux Artifacts
         run: |
