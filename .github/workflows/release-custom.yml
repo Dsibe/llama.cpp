@@ -1,0 +1,241 @@
+name: Release Custom Builds (Windows, macOS Legacy, Linux 22.04)
+
+on:
+  workflow_dispatch: # Triggers ONLY when you manually click "Run workflow"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =========================================================================
+  # 1. WINDOWS MODERN X64 CPU
+  # =========================================================================
+  windows-modern-cpu:
+    name: Windows x64 (Modern CPU)
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Setup ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: llama-modern-cpu-win-${{ runner.os }}
+          evict-old-files: 1d
+
+      - name: Build Modern x64 CPU
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -D CMAKE_C_FLAGS="-march=x86-64-v3" ^
+            -D CMAKE_CXX_FLAGS="-march=x86-64-v3" ^
+            -D CMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+            -D GGML_NATIVE=OFF ^
+            -D GGML_BACKEND_DL=ON ^
+            -D GGML_CPU_ALL_VARIANTS=ON ^
+            -D GGML_OPENMP=ON ^
+            -D GGML_OPENMP_FETCH=ON ^
+            -D GGML_BLAS=OFF ^
+            -D LLAMA_BUILD_BORINGSSL=ON ^
+            -D LLAMA_BUILD_SERVER=ON ^
+            -D LLAMA_BUILD_TOOLS=ON ^
+            -D GGML_RPC=ON ^
+            -D LLAMA_CONNECT=ON ^
+            -D LLAMA_BUILD_EXAMPLES=OFF ^
+            -D LLAMA_BUILD_TESTS=OFF
+
+          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
+
+      - name: Pack Windows Artifacts
+        shell: cmd
+        run: |
+          copy LICENSE .\build\bin\Release\
+          del /Q .\build\bin\Release\ggml-cpu-x64.dll
+          del /Q .\build\bin\Release\ggml-cpu-sse42.dll
+          del /Q .\build\bin\Release\ggml-cpu-sandybridge.dll
+          del /Q .\build\bin\Release\ggml-cpu-ivybridge.dll
+          del /Q .\build\bin\Release\ggml-cpu-piledriver.dll
+
+          (
+            echo @echo off
+            echo :: llama-server Optimized Windows Launcher
+            echo set OMP_PROC_BIND=close
+            echo set OMP_PLACES=cores
+            echo set OMP_WAIT_POLICY=ACTIVE
+            echo set OMP_DYNAMIC=false
+            echo llama-server.exe --flash-attn on %%*
+          ) > .\build\bin\Release\run-server-optimized.bat
+
+          7z a -snl llama-bin-win-cpu-modern-x64.zip .\build\bin\Release\*
+
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-bin-win-cpu-modern-x64
+          path: llama-bin-win-cpu-modern-x64.zip
+          retention-days: 14
+
+  # =========================================================================
+  # 2. MACOS LEGACY INTEL X64 (2012–2020)
+  # =========================================================================
+  macos-legacy-intel:
+    name: macOS Legacy Intel x64 (10.15+)
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: Setup ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: llama-legacy-macos-x64-${{ runner.os }}
+          evict-old-files: 1d
+
+      - name: Build macOS Legacy Binaries
+        run: |
+          cmake -S . -B build -G "Ninja Multi-Config" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="10.15" \
+            -DCMAKE_INSTALL_RPATH='@loader_path' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BLAS=OFF \
+            -DGGML_METAL=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_OPENMP=OFF \
+            -DLLAMA_BUILD_BORINGSSL=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DGGML_RPC=ON \
+            -DLLAMA_CONNECT=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TESTS=OFF
+
+          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
+
+      - name: Pack macOS Artifacts
+        run: |
+          cp LICENSE build/bin/Release/
+          tar -czvf llama-bin-macos-legacy-x64.tar.gz -C build/bin/Release .
+
+      - name: Upload macOS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-bin-macos-legacy-x64
+          path: llama-bin-macos-legacy-x64.tar.gz
+          retention-days: 14
+
+  # =========================================================================
+  # 3. LINUX UBUNTU 22.04 LTS (x64 & arm64 | CPU & Vulkan)
+  # =========================================================================
+  linux-ubuntu22:
+    name: Linux 22.04 (${{ matrix.arch }} - ${{ matrix.backend }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: 'x64'
+            backend: 'cpu'
+            runner: 'ubuntu-22.04'
+            defines: '-DGGML_VULKAN=OFF'
+          - arch: 'x64'
+            backend: 'vulkan'
+            runner: 'ubuntu-22.04'
+            defines: '-DGGML_VULKAN=ON'
+          - arch: 'arm64'
+            backend: 'cpu'
+            runner: 'ubuntu-22.04-arm'
+            defines: '-DGGML_VULKAN=OFF'
+          - arch: 'arm64'
+            backend: 'vulkan'
+            runner: 'ubuntu-22.04-arm'
+            defines: '-DGGML_VULKAN=ON'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup GCC 13 Toolchain (on Ubuntu 22.04)
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13 build-essential cmake ninja-build libssl-dev
+          echo "CC=gcc-13" >> "$GITHUB_ENV"
+          echo "CXX=g++-13" >> "$GITHUB_ENV"
+
+      - name: Setup Vulkan Dependencies
+        if: ${{ matrix.backend == 'vulkan' }}
+        run: |
+          if [ "${{ matrix.arch }}" = "x64" ]; then
+            wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+            sudo apt-get update -y
+            sudo apt-get install -y mesa-vulkan-drivers vulkan-sdk glslc
+          else
+            sudo apt-get install -y libvulkan-dev glslc libshaderc-dev spirv-headers mesa-vulkan-drivers
+          fi
+
+      - name: Setup ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: llama-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}
+          evict-old-files: 1d
+
+      - name: Build Linux Binaries
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_OPENMP=ON \
+            -DLLAMA_BUILD_BORINGSSL=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DGGML_RPC=ON \
+            -DLLAMA_CONNECT=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            ${{ matrix.defines }}
+
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Verify GLIBC Compatibility
+        run: |
+          echo "=== Verifying GLIBC <= 2.35 ==="
+          objdump -p build/bin/llama-cli | grep GLIBC_
+
+      - name: Pack Linux Artifacts
+        run: |
+          cp LICENSE build/bin/
+          tar -czvf llama-bin-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}.tar.gz -C build/bin .
+
+      - name: Upload Linux Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-bin-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}
+          path: llama-bin-ubuntu22-${{ matrix.arch }}-${{ matrix.backend }}.tar.gz
+          retention-days: 14
