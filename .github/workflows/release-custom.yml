@@ -358,13 +358,99 @@ jobs:
           name: llama-ui.zip
           path: tools/ui/dist
 
+      - name: Restore GCC ${{ matrix.gcc_version }} APT cache
+        id: cache_gcc
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/gcc-apt-cache
+          key: ubuntu22-gcc-${{ matrix.gcc_version }}-${{ matrix.arch }}-${{ matrix.backend }}-v1
+          restore-keys: |
+            ubuntu22-gcc-${{ matrix.gcc_version }}-${{ matrix.arch }}-
+
       - name: Setup Toolchain (GCC ${{ matrix.gcc_version }} on Ubuntu 22.04)
+        id: setup_toolchain
         run: |
-          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-          sudo apt-get update
-          sudo apt-get install -y gcc-${{ matrix.gcc_version }} g++-${{ matrix.gcc_version }} build-essential cmake ninja-build libssl-dev
-          echo "CC=gcc-${{ matrix.gcc_version }}" >> "$GITHUB_ENV"
-          echo "CXX=g++-${{ matrix.gcc_version }}" >> "$GITHUB_ENV"
+          set -euo pipefail
+          GCC_VER="${{ matrix.gcc_version }}"
+          APT_OPTS=(
+            -o Acquire::Retries=8
+            -o Acquire::http::Pipeline-Depth=0
+            -o Acquire::https::Pipeline-Depth=0
+            -o Acquire::Queue-Mode=host
+            -o Acquire::http::Timeout=30
+            -o Acquire::https::Timeout=30
+          )
+
+          sudo apt-get update "${APT_OPTS[@]}"
+          sudo apt-get install -y --no-install-recommends "${APT_OPTS[@]}" \
+            build-essential cmake ninja-build libssl-dev ca-certificates software-properties-common
+
+          INSTALLED=0
+          if compgen -G "/tmp/gcc-apt-cache/*.deb" > /dev/null; then
+            echo "Installing gcc-${GCC_VER} / g++-${GCC_VER} from cached .deb packages..."
+            if sudo apt-get install -y --no-install-recommends "${APT_OPTS[@]}" /tmp/gcc-apt-cache/*.deb; then
+              INSTALLED=1
+            else
+              echo "Cached .deb install failed; falling back to PPA download..."
+            fi
+          fi
+
+          if [ "$INSTALLED" -eq 0 ]; then
+            sudo apt-get clean
+            for k in 1 2 3; do
+              sudo add-apt-repository -y -n ppa:ubuntu-toolchain-r/test && break || sleep 10
+            done
+
+            MIRRORS=(
+              "https://ppa.launchpadcontent.net"
+              "https://ppa.launchpadcontent.net"
+              "http://ppa.launchpadcontent.net"
+              "https://ppa.launchpad.net"
+              "https://launchpad.proxy.ustclug.org"
+              "https://ppa.launchpadcontent.net"
+            )
+
+            DOWNLOADED=0
+            for idx in "${!MIRRORS[@]}"; do
+              MIRROR="${MIRRORS[$idx]}"
+              ATTEMPT=$((idx + 1))
+              echo "Downloading gcc-${GCC_VER} / g++-${GCC_VER} via ${MIRROR} (attempt ${ATTEMPT}/${#MIRRORS[@]})..."
+              sudo find /etc/apt/sources.list.d -maxdepth 1 -name '*ubuntu-toolchain*' -type f -exec \
+                sed -i -E "s#https?://(ppa\.launchpadcontent\.net|ppa\.launchpad\.net|launchpad\.proxy\.ustclug\.org)#${MIRROR}#g" {} +
+
+              sudo apt-get update "${APT_OPTS[@]}" || true
+              if sudo apt-get install -d -y --no-install-recommends --fix-missing "${APT_OPTS[@]}" \
+                "gcc-${GCC_VER}" "g++-${GCC_VER}"; then
+                DOWNLOADED=1
+                break
+              fi
+              sleep $((ATTEMPT * 10))
+            done
+
+            if [ "$DOWNLOADED" -ne 1 ]; then
+              echo "::error::Failed to download gcc-${GCC_VER} / g++-${GCC_VER} from Launchpad and fallback mirrors."
+              exit 1
+            fi
+
+            sudo apt-get install -y --no-install-recommends "${APT_OPTS[@]}" "gcc-${GCC_VER}" "g++-${GCC_VER}"
+            mkdir -p /tmp/gcc-apt-cache
+            rm -f /tmp/gcc-apt-cache/*.deb
+            cp /var/cache/apt/archives/*.deb /tmp/gcc-apt-cache/
+            chmod -R a+rX /tmp/gcc-apt-cache
+            echo "save_cache=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          "gcc-${GCC_VER}" --version
+          echo "CC=gcc-${GCC_VER}" >> "$GITHUB_ENV"
+          echo "CXX=g++-${GCC_VER}" >> "$GITHUB_ENV"
+
+      - name: Save GCC ${{ matrix.gcc_version }} APT cache
+        if: ${{ steps.cache_gcc.outputs.cache-hit != 'true' || steps.setup_toolchain.outputs.save_cache == 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/gcc-apt-cache
+          key: ubuntu22-gcc-${{ matrix.gcc_version }}-${{ matrix.arch }}-${{ matrix.backend }}-v1
 
       - name: Setup Vulkan Dependencies
         if: ${{ matrix.backend == 'vulkan' }}
