@@ -7,9 +7,18 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  actions: write
+  contents: read
+
 jobs:
+  ui-build:
+    name: Build Web UI
+    uses: ./.github/workflows/ui-build.yml
+
   windows-arm64:
     name: Windows ARM64 (${{ matrix.tier }})
+    needs: [ui-build]
     runs-on: windows-2025-vs2026
 
     strategy:
@@ -28,9 +37,15 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Download UI build
+        uses: actions/download-artifact@v8
+        with:
+          name: llama-ui.zip
+          path: tools/ui/dist
 
       - name: Install Ninja
         run: choco install ninja
@@ -45,10 +60,12 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" amd64_arm64
+          set "ARM_FLAGS=-march=${{ matrix.march }} -fvectorize -ffp-model=fast -fno-finite-math-only -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH -Wno-format -Wno-unused-variable -Wno-unused-function -Wno-gnu-zero-variadic-macro-arguments"
+
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake ^
-            -D CMAKE_C_FLAGS="-march=${{ matrix.march }} -fvectorize -ffp-model=fast -fno-finite-math-only" ^
-            -D CMAKE_CXX_FLAGS="-march=${{ matrix.march }} -fvectorize -ffp-model=fast -fno-finite-math-only" ^
+            -D CMAKE_C_FLAGS="%ARM_FLAGS%" ^
+            -D CMAKE_CXX_FLAGS="%ARM_FLAGS%" ^
             -D CMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
             -D GGML_NATIVE=OFF ^
             -D GGML_CPU_ARM_ARCH=${{ matrix.march }} ^
@@ -61,7 +78,7 @@ jobs:
             -D LLAMA_BUILD_SERVER=ON ^
             -D LLAMA_BUILD_TOOLS=ON ^
             -D GGML_RPC=ON ^
-            -D LLAMA_CONNECT=ON ^
+            -D LLAMA_CONNECT=OFF ^
             -D LLAMA_BUILD_EXAMPLES=OFF ^
             -D LLAMA_BUILD_TESTS=OFF
 
@@ -73,12 +90,11 @@ jobs:
           Write-Host "=== CMakeCache Compiler Flags ==="
           Select-String -Path build\CMakeCache.txt -Pattern "CMAKE_C_FLAGS:|CMAKE_CXX_FLAGS:|GGML_CPU_ARM_ARCH:" | ForEach-Object { $_.Line }
 
-          # Locate llvm-objdump from VS LLVM or system LLVM
           $objdump = Get-Command llvm-objdump.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
           if (-not $objdump) {
             $candidates = @(
-              "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin\llvm-objdump.exe",
-              "C:\Program Files\LLVM\bin\llvm-objdump.exe"
+              "C:\Program Files\LLVM\bin\llvm-objdump.exe",
+              "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin\llvm-objdump.exe"
             )
             $objdump = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
           }
@@ -95,10 +111,12 @@ jobs:
           ) | Where-Object { Test-Path $_ }
 
           $forbid = '${{ matrix.forbid_regex }}'
+          $cpuSdotCount = 0
           foreach ($bin in $bins) {
             $asm = & $objdump -d --triple=aarch64-pc-windows-msvc $bin
             $sdotCount = ($asm | Select-String -Pattern '\b(sdot|udot)\b').Count
             $i8mmCount = ($asm | Select-String -Pattern '\b(smmla|usmmla|sudot)\b').Count
+            if ($bin -like '*ggml-cpu.dll') { $cpuSdotCount = $sdotCount }
             Write-Host "$bin -> sdot/udot: $sdotCount | smmla/usmmla/sudot (i8mm): $i8mmCount"
 
             if ($forbid) {
@@ -110,8 +128,8 @@ jobs:
             }
           }
 
-          if ('${{ matrix.tier }}' -eq 'balanced' -and $sdotCount -eq 0) {
-            Write-Warning "No sdot/udot found in last inspected binary (check ggml-cpu.dll line above)."
+          if ('${{ matrix.tier }}' -eq 'balanced' -and $cpuSdotCount -eq 0) {
+            throw "Expected sdot/udot instructions in ggml-cpu.dll for 'balanced' tier, but found 0!"
           }
 
       - name: Pack Windows ARM64 Artifacts
@@ -132,7 +150,7 @@ jobs:
           7z a -snl llama-bin-win-cpu-arm64-${{ matrix.tier }}.zip .\build\bin\Release\*
 
       - name: Upload Windows ARM64 Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: llama-bin-win-cpu-arm64-${{ matrix.tier }}
           path: llama-bin-win-cpu-arm64-${{ matrix.tier }}.zip
