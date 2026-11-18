@@ -1,0 +1,139 @@
+name: Build Windows ARM64 Tiers
+
+on:
+  workflow_dispatch: # Triggers ONLY when you manually click "Run workflow"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-arm64:
+    name: Windows ARM64 (${{ matrix.tier }})
+    runs-on: windows-2025-vs2026
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tier: 'compat'
+            march: 'armv8-a'
+            forbid_regex: '\b(sdot|udot|smmla|usmmla|sudot)\b'
+          - tier: 'balanced'
+            march: 'armv8.2-a+dotprod'
+            forbid_regex: '\b(smmla|usmmla|sudot)\b'
+          - tier: 'modern'
+            march: 'armv8.7-a+fp16+dotprod+i8mm'
+            forbid_regex: ''
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Setup ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: llama-win-arm64-${{ matrix.tier }}-${{ runner.os }}
+          evict-old-files: 1d
+
+      - name: Build Windows ARM64 (${{ matrix.tier }})
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" amd64_arm64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake ^
+            -D CMAKE_C_FLAGS="-march=${{ matrix.march }} -fvectorize -ffp-model=fast -fno-finite-math-only" ^
+            -D CMAKE_CXX_FLAGS="-march=${{ matrix.march }} -fvectorize -ffp-model=fast -fno-finite-math-only" ^
+            -D CMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+            -D GGML_NATIVE=OFF ^
+            -D GGML_CPU_ARM_ARCH=${{ matrix.march }} ^
+            -D GGML_BACKEND_DL=OFF ^
+            -D GGML_CPU_ALL_VARIANTS=OFF ^
+            -D GGML_OPENMP=ON ^
+            -D GGML_OPENMP_FETCH=ON ^
+            -D GGML_BLAS=OFF ^
+            -D LLAMA_BUILD_BORINGSSL=ON ^
+            -D LLAMA_BUILD_SERVER=ON ^
+            -D LLAMA_BUILD_TOOLS=ON ^
+            -D GGML_RPC=ON ^
+            -D LLAMA_CONNECT=ON ^
+            -D LLAMA_BUILD_EXAMPLES=OFF ^
+            -D LLAMA_BUILD_TESTS=OFF
+
+          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
+
+      - name: Verify Emitted ARM64 Instructions (Static Disassembly Gate)
+        shell: powershell
+        run: |
+          Write-Host "=== CMakeCache Compiler Flags ==="
+          Select-String -Path build\CMakeCache.txt -Pattern "CMAKE_C_FLAGS:|CMAKE_CXX_FLAGS:|GGML_CPU_ARM_ARCH:" | ForEach-Object { $_.Line }
+
+          # Locate llvm-objdump from VS LLVM or system LLVM
+          $objdump = Get-Command llvm-objdump.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+          if (-not $objdump) {
+            $candidates = @(
+              "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin\llvm-objdump.exe",
+              "C:\Program Files\LLVM\bin\llvm-objdump.exe"
+            )
+            $objdump = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $objdump) {
+            throw "llvm-objdump.exe not found; cannot verify emitted ARM64 instructions."
+          }
+          Write-Host "Using: $objdump"
+
+          $bins = @(
+            "build\bin\Release\ggml-cpu.dll",
+            "build\bin\Release\ggml-base.dll",
+            "build\bin\Release\llama.dll",
+            "build\bin\Release\llama-server.exe"
+          ) | Where-Object { Test-Path $_ }
+
+          $forbid = '${{ matrix.forbid_regex }}'
+          foreach ($bin in $bins) {
+            $asm = & $objdump -d --triple=aarch64-pc-windows-msvc $bin
+            $sdotCount = ($asm | Select-String -Pattern '\b(sdot|udot)\b').Count
+            $i8mmCount = ($asm | Select-String -Pattern '\b(smmla|usmmla|sudot)\b').Count
+            Write-Host "$bin -> sdot/udot: $sdotCount | smmla/usmmla/sudot (i8mm): $i8mmCount"
+
+            if ($forbid) {
+              $hits = $asm | Select-String -Pattern $forbid
+              if ($hits.Count -gt 0) {
+                $hits | Select-Object -First 10 | ForEach-Object { Write-Error $_.Line }
+                throw "Forbidden instructions ($forbid) found in $bin for tier '${{ matrix.tier }}'!"
+              }
+            }
+          }
+
+          if ('${{ matrix.tier }}' -eq 'balanced' -and $sdotCount -eq 0) {
+            Write-Warning "No sdot/udot found in last inspected binary (check ggml-cpu.dll line above)."
+          }
+
+      - name: Pack Windows ARM64 Artifacts
+        shell: cmd
+        run: |
+          copy LICENSE .\build\bin\Release\
+
+          (
+            echo @echo off
+            echo :: llama-server Optimized Windows ARM64 Launcher (${{ matrix.tier }})
+            echo set OMP_PROC_BIND=close
+            echo set OMP_PLACES=cores
+            echo set OMP_WAIT_POLICY=ACTIVE
+            echo set OMP_DYNAMIC=false
+            echo llama-server.exe --flash-attn on %%*
+          ) > .\build\bin\Release\run-server-optimized.bat
+
+          7z a -snl llama-bin-win-cpu-arm64-${{ matrix.tier }}.zip .\build\bin\Release\*
+
+      - name: Upload Windows ARM64 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-bin-win-cpu-arm64-${{ matrix.tier }}
+          path: llama-bin-win-cpu-arm64-${{ matrix.tier }}.zip
+          retention-days: 14
